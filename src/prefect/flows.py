@@ -45,7 +45,7 @@ from uuid import UUID
 import pydantic
 from exceptiongroup import BaseExceptionGroup, ExceptionGroup
 from rich.console import Console
-from typing_extensions import Literal, ParamSpec
+from typing_extensions import Concatenate, Literal, ParamSpec
 
 from prefect._experimental.sla.objects import SlaTypes
 from prefect._internal.concurrency.api import create_call, from_async, from_sync
@@ -115,6 +115,8 @@ if TYPE_CHECKING:
 T = TypeVar("T")  # Generic type var for capturing the inner return type of async funcs
 R = TypeVar("R")  # The return type of the user's function
 P = ParamSpec("P")  # The parameters of the flow
+S = TypeVar("S")  # The instance a decorated method is accessed on
+P2 = ParamSpec("P2")  # A decorated method's params after `self` is bound
 F = TypeVar("F", bound="Flow[Any, Any]")  # The type of the flow
 
 
@@ -429,7 +431,25 @@ class Flow(Generic[P, R]):
     def isstaticmethod(self) -> bool:
         return getattr(self, "_isstaticmethod", False)
 
-    def __get__(self, instance: Any, owner: Any) -> "Flow[P, R]":
+    # Accessing a decorated method on an instance binds `self` at runtime via
+    # `__prefect_self__`, so the bound signature must drop its leading parameter.
+    # Order matters: the `instance: None` case must come first, and the trailing
+    # catch-all keeps `@staticmethod`/`@classmethod` tasks from being stripped.
+    # Known gap: mypy binds `S` from `instance` without checking it against the
+    # `self:` type, so a `@staticmethod` task reached through an instance
+    # (`c.s(1)`) over-strips; class access (`C.s(1)`) and pyright are correct.
+    @overload
+    def __get__(self, instance: None, owner: Any) -> "Flow[P, R]": ...
+
+    @overload
+    def __get__(
+        self: "Flow[Concatenate[S, P2], R]", instance: S, owner: Any
+    ) -> "Flow[P2, R]": ...
+
+    @overload
+    def __get__(self, instance: Any, owner: Any) -> "Flow[P, R]": ...
+
+    def __get__(self, instance: Any, owner: Any) -> "Any":
         """
         Implement the descriptor protocol so that the flow can be used as an instance or class method.
         When an instance method is loaded, this method is called with the "self" instance as
