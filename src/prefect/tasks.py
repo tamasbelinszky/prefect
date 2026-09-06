@@ -30,6 +30,7 @@ from typing import (
 from uuid import UUID, uuid4
 
 from typing_extensions import (
+    Concatenate,
     Literal,
     ParamSpec,
     Self,
@@ -91,6 +92,8 @@ if TYPE_CHECKING:
 T = TypeVar("T")
 R = TypeVar("R")  # The return type of the user's function
 P = ParamSpec("P")  # The parameters of the task
+S = TypeVar("S")  # The instance a decorated method is accessed on
+P2 = ParamSpec("P2")  # A decorated method's params after `self` is bound
 
 NUM_CHARS_DYNAMIC_KEY = 8
 
@@ -645,7 +648,25 @@ class Task(Generic[P, R]):
     def isstaticmethod(self) -> bool:
         return getattr(self, "_isstaticmethod", False)
 
-    def __get__(self, instance: Any, owner: Any) -> "Task[P, R]":
+    # Accessing a decorated method on an instance binds `self` at runtime via
+    # `__prefect_self__`, so the bound signature must drop its leading parameter.
+    # Order matters: the `instance: None` case must come first, and the trailing
+    # catch-all keeps `@staticmethod`/`@classmethod` tasks from being stripped.
+    # Known gap: mypy binds `S` from `instance` without checking it against the
+    # `self:` type, so a `@staticmethod` task reached through an instance
+    # (`c.s(1)`) over-strips; class access (`C.s(1)`) and pyright are correct.
+    @overload
+    def __get__(self, instance: None, owner: Any) -> "Task[P, R]": ...
+
+    @overload
+    def __get__(
+        self: "Task[Concatenate[S, P2], R]", instance: S, owner: Any
+    ) -> "Task[P2, R]": ...
+
+    @overload
+    def __get__(self, instance: Any, owner: Any) -> "Task[P, R]": ...
+
+    def __get__(self, instance: Any, owner: Any) -> "Any":
         """
         Implement the descriptor protocol so that the task can be used as an instance method.
         When an instance method is loaded, this method is called with the "self" instance as
@@ -1231,6 +1252,17 @@ class Task(Generic[P, R]):
             return_type=return_type,
         )
 
+    # Coroutine-self overloads must precede their generic twins (the generic
+    # shape also matches an async task) and must destructure via the
+    # method-scoped `T` — the class-scoped `R` is already bound to the whole
+    # coroutine and cannot re-solve. See tests/typing/call_annotations.py.
+    @overload
+    def submit(
+        self: "Task[P, Coroutine[Any, Any, T]]",
+        *args: P.args,
+        **kwargs: P.kwargs,
+    ) -> PrefectFuture[T]: ...
+
     @overload
     def submit(
         self: "Task[P, R]",
@@ -1240,7 +1272,16 @@ class Task(Generic[P, R]):
 
     @overload
     def submit(
-        self: "Task[P, Coroutine[Any, Any, R]]",
+        self: "Task[P, Coroutine[Any, Any, T]]",
+        *args: P.args,
+        return_state: Literal[False],
+        wait_for: Optional[OneOrManyFutureOrResult[Any]] = None,
+        **kwargs: P.kwargs,
+    ) -> PrefectFuture[T]: ...
+
+    @overload
+    def submit(
+        self: "Task[P, R]",
         *args: P.args,
         return_state: Literal[False],
         wait_for: Optional[OneOrManyFutureOrResult[Any]] = None,
@@ -1249,21 +1290,12 @@ class Task(Generic[P, R]):
 
     @overload
     def submit(
-        self: "Task[P, R]",
-        *args: P.args,
-        return_state: Literal[False],
-        wait_for: Optional[OneOrManyFutureOrResult[Any]] = None,
-        **kwargs: P.kwargs,
-    ) -> PrefectFuture[R]: ...
-
-    @overload
-    def submit(
-        self: "Task[P, Coroutine[Any, Any, R]]",
+        self: "Task[P, Coroutine[Any, Any, T]]",
         *args: P.args,
         return_state: Literal[True],
         wait_for: Optional[OneOrManyFutureOrResult[Any]] = None,
         **kwargs: P.kwargs,
-    ) -> State[R]: ...
+    ) -> State[T]: ...
 
     @overload
     def submit(
@@ -1415,6 +1447,28 @@ class Task(Generic[P, R]):
         else:
             return future
 
+    # Same rules as `submit` above: Coroutine-self first, method-scoped `T`.
+    # `Literal[False]` needs its default so a plain `.map(...)` matches it.
+    @overload
+    def map(
+        self: "Task[P, Coroutine[Any, Any, T]]",
+        *args: Any,
+        return_state: Literal[False] = ...,
+        wait_for: Optional[Iterable[Union[PrefectFuture[T], T]]] = ...,
+        deferred: bool = ...,
+        **kwargs: Any,
+    ) -> PrefectFutureList[T]: ...
+
+    @overload
+    def map(
+        self: "Task[P, Coroutine[Any, Any, T]]",
+        *args: Any,
+        return_state: Literal[True],
+        wait_for: Optional[Iterable[Union[PrefectFuture[T], T]]] = ...,
+        deferred: bool = ...,
+        **kwargs: Any,
+    ) -> list[State[T]]: ...
+
     @overload
     def map(
         self: "Task[P, R]",
@@ -1429,45 +1483,6 @@ class Task(Generic[P, R]):
     def map(
         self: "Task[P, R]",
         *args: Any,
-        wait_for: Optional[Iterable[Union[PrefectFuture[R], R]]] = ...,
-        deferred: bool = ...,
-        **kwargs: Any,
-    ) -> PrefectFutureList[R]: ...
-
-    @overload
-    def map(
-        self: "Task[P, R]",
-        *args: Any,
-        return_state: Literal[True],
-        wait_for: Optional[Iterable[Union[PrefectFuture[R], R]]] = ...,
-        deferred: bool = ...,
-        **kwargs: Any,
-    ) -> list[State[R]]: ...
-
-    @overload
-    def map(
-        self: "Task[P, R]",
-        *args: Any,
-        wait_for: Optional[Iterable[Union[PrefectFuture[R], R]]] = ...,
-        deferred: bool = ...,
-        **kwargs: Any,
-    ) -> PrefectFutureList[R]: ...
-
-    @overload
-    def map(
-        self: "Task[P, Coroutine[Any, Any, R]]",
-        *args: Any,
-        return_state: Literal[True],
-        wait_for: Optional[Iterable[Union[PrefectFuture[R], R]]] = ...,
-        deferred: bool = ...,
-        **kwargs: Any,
-    ) -> list[State[R]]: ...
-
-    @overload
-    def map(
-        self: "Task[P, Coroutine[Any, Any, R]]",
-        *args: Any,
-        return_state: Literal[False],
         wait_for: Optional[Iterable[Union[PrefectFuture[R], R]]] = ...,
         deferred: bool = ...,
         **kwargs: Any,
@@ -1864,6 +1879,31 @@ class Task(Generic[P, R]):
         serve(self)
 
 
+# Normalizes an async def's inferred `types.CoroutineType` to `Coroutine`;
+class _TaskDecorator(Protocol):
+    """The decorator returned by a configured `@task(...)` call. Declared as a
+    protocol so applying it re-runs the same async-normalizing overloads as
+    the bare `@task` form. See tests/typing/call_annotations.py."""
+
+    @overload
+    def __call__(
+        self, __fn: Callable[P, Coroutine[Any, Any, R]]
+    ) -> Task[P, Coroutine[Any, Any, R]]: ...
+
+    @overload
+    def __call__(self, __fn: Callable[P, R]) -> Task[P, R]: ...
+
+    def __call__(self, __fn: Callable[..., Any]) -> Task[..., Any]: ...
+
+
+# as the Task's invariant R it would stop every `self: "Task[...,
+# Coroutine[...]]"` overload from matching. See tests/typing/call_annotations.py.
+@overload
+def task(
+    __fn: Callable[P, Coroutine[Any, Any, R]],
+) -> Task[P, Coroutine[Any, Any, R]]: ...
+
+
 @overload
 def task(__fn: Callable[P, R]) -> Task[P, R]: ...
 
@@ -1902,7 +1942,7 @@ def task(
     retry_condition_fn: Optional[RetryConditionCallable] = None,
     viz_return_value: Any = None,
     asset_deps: Optional[list[Union[str, Asset]]] = None,
-) -> Callable[[Callable[P, R]], Task[P, R]]: ...
+) -> "_TaskDecorator": ...
 
 
 # see https://github.com/PrefectHQ/prefect/issues/16380
@@ -1939,7 +1979,7 @@ def task(
     retry_condition_fn: Optional[RetryConditionCallable] = None,
     viz_return_value: Any = None,
     asset_deps: Optional[list[Union[str, Asset]]] = None,
-) -> Callable[[Callable[P, R]], Task[P, R]]: ...
+) -> "_TaskDecorator": ...
 
 
 @overload  # TODO: do we need this overload?
@@ -1977,7 +2017,7 @@ def task(
     retry_condition_fn: Optional[RetryConditionCallable] = None,
     viz_return_value: Any = None,
     asset_deps: Optional[list[Union[str, Asset]]] = None,
-) -> Callable[[Callable[P, R]], Task[P, R]]: ...
+) -> "_TaskDecorator": ...
 
 
 def task(

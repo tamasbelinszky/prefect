@@ -57,7 +57,16 @@ if TYPE_CHECKING:
 P = ParamSpec("P")
 T = TypeVar("T")
 R = TypeVar("R")
-F = TypeVar("F", bound=PrefectFuture[Any], default=PrefectConcurrentFuture[Any])
+# Covariant: `F` appears only in return position, and a concrete runner such as
+# `ThreadPoolTaskRunner(max_workers=3)` leaves its result type unsolved. Without
+# covariance the resulting `TaskRunner[PrefectConcurrentFuture[Never]]` is not
+# assignable to the `task_runner` parameter of `@flow`. See #16938.
+F = TypeVar(
+    "F",
+    bound=PrefectFuture[Any],
+    default=PrefectConcurrentFuture[Any],
+    covariant=True,
+)
 
 
 class TaskRunner(abc.ABC, Generic[F]):
